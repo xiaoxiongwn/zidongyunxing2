@@ -1,0 +1,32 @@
+# PyInstaller version resource.
+# Embedding proper version/company metadata into the exe makes it look like
+# a normal signed application instead of an anonymous unknown binary, which
+# some antivirus heuristics take into account.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'080404b0',
+          [StringStruct(u'CompanyName', u'Open Source'),
+           StringStruct(u'FileDescription', u'Editable Keyboard & Mouse Macro Recorder'),
+           StringStruct(u'FileVersion', u'1.0.0.0'),
+           StringStruct(u'InternalName', u'MacroRecorder'),
+           StringStruct(u'LegalCopyright', u'MIT License'),
+           StringStruct(u'OriginalFilename', u'MacroRecorder.exe'),
+           StringStruct(u'ProductName', u'Editable Macro Recorder'),
+           StringStruct(u'ProductVersion', u'1.0.0.0')])
+      ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
