@@ -93,6 +93,19 @@ def set_ime_status(open_status):
         pass
 
 
+def maximize_foreground_window():
+    """Force the currently foreground (active) window to maximized state,
+    regardless of whatever size/position it happened to open at."""
+    if sys.platform != "win32":
+        return
+    try:
+        SW_MAXIMIZE = 3
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
+    except Exception:
+        pass
+
+
 def key_str_to_key(s):
     if s.startswith("char:"):
         return KeyCode.from_char(s[5:])
@@ -158,6 +171,8 @@ def execute_action(a, mouse_ctl, kb_ctl):
         set_ime_status(a.get("open", True))
     elif t == "type_text":
         kb_ctl.type(a.get("text", ""))
+    elif t == "maximize_window":
+        maximize_foreground_window()
 
 
 def run_gui(payload):
