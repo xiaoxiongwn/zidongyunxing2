@@ -11,9 +11,10 @@ Dependencies:
     pip install pynput
 
 Global hotkeys (work even when this window is not focused):
-    F9   - Start / Stop recording
-    F10  - Start / Stop playback
-    ESC  - Abort playback immediately
+    Ctrl+Alt+Shift+R  - Start recording
+    Ctrl+Alt+Shift+P  - Stop recording
+    F10               - Start / Stop playback
+    ESC               - Abort playback immediately
 
 Run:
     python recorder_gui.py
@@ -60,6 +61,10 @@ MOVE_THROTTLE_S = 0.02  # only record a mouse-move at most every 20ms, to keep t
 # exported exe locates where its own data starts.
 PLAYER_MARKER = b"\n#####MACRO_PAYLOAD_BEGIN#####\n"
 
+# Recording start/stop hotkeys (separate keys, not a toggle).
+RECORD_START_HOTKEY = "ctrl+alt+shift+r"
+RECORD_STOP_HOTKEY = "ctrl+alt+shift+p"
+
 
 def toggle_ime():
     """Toggle the Chinese/English input method state of the foreground
@@ -104,6 +109,22 @@ def set_ime_status(open_status):
         if himc:
             imm32.ImmSetOpenStatus(himc, 1 if open_status else 0)
             imm32.ImmReleaseContext(hwnd, himc)
+    except Exception:
+        pass
+
+
+def maximize_foreground_window():
+    """Force the currently foreground (active) window to maximized state,
+    regardless of whatever size/position it happened to open at. Meant to
+    be inserted right after an action that opens a browser/program, so
+    every subsequent coordinate-based click lands on a window of the exact
+    same, predictable size every time."""
+    if sys.platform != "win32":
+        return
+    try:
+        SW_MAXIMIZE = 3
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
     except Exception:
         pass
 
@@ -222,6 +243,8 @@ def action_summary(a):
         if len(preview) > 20:
             preview = preview[:20] + "..."
         return f'输入文本: "{preview}"'
+    if t == "maximize_window":
+        return "最大化当前窗口"
     return str(a)
 
 
@@ -254,7 +277,8 @@ class MacroApp:
 
         self.speed_var = tk.DoubleVar(value=1.0)
         self.repeat_var = tk.IntVar(value=1)
-        self.status_var = tk.StringVar(value="就绪。F9=录制 F10=回放 ESC=中止回放")
+        self.status_var = tk.StringVar(
+            value="就绪。Ctrl+Alt+Shift+R=开始录制  Ctrl+Alt+Shift+P=停止录制  F10=播放  ESC=中止播放")
 
         self._build_ui()
         self._start_hotkey_listener()
@@ -268,7 +292,7 @@ class MacroApp:
         toolbar = ttk.Frame(self.root, padding=6)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
-        self.btn_record = ttk.Button(toolbar, text="● 开始录制 (F9)", command=self.toggle_recording)
+        self.btn_record = ttk.Button(toolbar, text="● 开始录制 (Ctrl+Alt+Shift+R)", command=self.toggle_recording)
         self.btn_record.pack(side=tk.LEFT, padx=3)
 
         self.btn_play = ttk.Button(toolbar, text="▶ 播放 (F10)", command=self.toggle_playback)
@@ -325,6 +349,7 @@ class MacroApp:
         ttk.Button(edit_bar, text="插入等待", command=self.insert_wait).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="插入-设为中文", command=lambda: self.insert_ime_set(True)).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="插入-设为英文", command=lambda: self.insert_ime_set(False)).pack(side=tk.LEFT, padx=3)
+        ttk.Button(edit_bar, text="插入-最大化窗口", command=self.insert_maximize_window).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="清空全部", command=self.clear_all).pack(side=tk.LEFT, padx=3)
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding=4)
@@ -368,7 +393,7 @@ class MacroApp:
                               values=(i + 1, a["type"], action_summary(a), a.get("delay_ms", 0)))
 
     # ----------------------------------------------------------------
-    # Global hotkey listener (always running: F9 / F10 / ESC)
+    # Global hotkey listener (always running: Ctrl+Alt+Shift+R/P, F10, ESC)
     # ----------------------------------------------------------------
     def _start_hotkey_listener(self):
         def on_press(key):
@@ -379,23 +404,27 @@ class MacroApp:
                 self._mod_alt = True
             elif key in (Key.shift, Key.shift_r):
                 self._mod_shift = True
-            elif self.mode in ("idle", "recording"):
-                # only non-modifier keys can complete a snippet hotkey combo
+            else:
                 combo = self._live_combo(key)
-                if combo and combo in self.hotkey_map:
+                if combo == RECORD_START_HOTKEY:
+                    self._swallow_next_release.add(key)
+                    if self.mode == "idle":
+                        self.root.after(0, self.start_recording)
+                    return
+                if combo == RECORD_STOP_HOTKEY:
+                    self._swallow_next_release.add(key)
+                    if self.mode == "recording":
+                        self.root.after(0, self.stop_recording)
+                    return
+                if self.mode in ("idle", "recording") and combo and combo in self.hotkey_map:
                     self._swallow_next_release.add(key)
                     self.root.after(0, self._trigger_snippet, self.hotkey_map[combo])
                     return
 
             if self.mode == "idle":
-                if key == Key.f9:
-                    self.root.after(0, self.start_recording)
-                elif key == Key.f10:
+                if key == Key.f10:
                     self.root.after(0, self.start_playback)
             elif self.mode == "recording":
-                if key == Key.f9:
-                    self.root.after(0, self.stop_recording)
-                    return
                 self._record_key_event(key, True)
             elif self.mode == "playing":
                 if key == Key.esc:
@@ -414,8 +443,6 @@ class MacroApp:
                 return
 
             if self.mode == "recording":
-                if key == Key.f9:
-                    return
                 self._record_key_event(key, False)
 
         self.kb_hotkey_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
@@ -439,8 +466,8 @@ class MacroApp:
         self.mode = "recording"
         self._last_event_time = time.perf_counter()
         self._last_move_time = 0.0
-        self.btn_record.config(text="■ 停止录制 (F9)")
-        self._set_status("录制中... 按 F9 停止")
+        self.btn_record.config(text="■ 停止录制 (Ctrl+Alt+Shift+P)")
+        self._set_status("录制中... 按 Ctrl+Alt+Shift+P 停止")
 
         self.mouse_listener = mouse.Listener(
             on_move=self._on_mouse_move,
@@ -456,7 +483,7 @@ class MacroApp:
         if self.mouse_listener:
             self.mouse_listener.stop()
             self.mouse_listener = None
-        self.btn_record.config(text="● 开始录制 (F9)")
+        self.btn_record.config(text="● 开始录制 (Ctrl+Alt+Shift+R)")
         self._refresh_table()
         self._set_status(f"录制完成，共 {len(self.actions)} 个动作。")
 
@@ -591,6 +618,8 @@ class MacroApp:
             # entirely -- reliable for Chinese/any Unicode text, unlike
             # replaying raw pinyin keystrokes.
             kb_ctl.type(a.get("text", ""))
+        elif t == "maximize_window":
+            maximize_foreground_window()
 
     def _finish_playback(self, aborted):
         self.mode = "idle"
@@ -731,6 +760,18 @@ class MacroApp:
         self._refresh_table()
         label = "中文" if open_status else "英文"
         self._set_status(f"已插入“设为{label}输入法”动作。")
+
+    def insert_maximize_window(self):
+        """Insert a 'force-maximize the active window' action -- typically
+        placed right after opening a browser/program (with a short wait
+        before it so the window has time to appear), so every subsequent
+        coordinate-based click lands on a window of a fixed, predictable
+        size no matter what size it happened to open at."""
+        sel = self._selected_indices()
+        pos = sel[-1] + 1 if sel else len(self.actions)
+        self.actions.insert(pos, {"type": "maximize_window", "delay_ms": 500})
+        self._refresh_table()
+        self._set_status("已插入“最大化当前窗口”动作。建议前面留足等待时间，确保窗口已经打开。")
 
     def clear_all(self):
         if self.actions and messagebox.askyesno(APP_TITLE, "确定清空所有动作吗？"):
