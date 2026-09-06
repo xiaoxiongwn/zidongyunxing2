@@ -650,6 +650,13 @@ class MacroApp:
         if self.force_chinese_var.get():
             set_ime_status(True)
 
+        # Track anything currently "held down" mid-playback, so that if we
+        # stop between a press and its matching release (e.g. ESC hits right
+        # after a click's "down" but before its "up"), we can force-release
+        # it afterwards instead of leaving the mouse button / key stuck down.
+        held_buttons = set()
+        held_keys = set()
+
         aborted = False
         for r in range(repeats):
             if aborted:
@@ -674,8 +681,33 @@ class MacroApp:
                     time.sleep(delay)
                 try:
                     self._execute_action(a, mouse_ctl, kb_ctl)
+                    t = a["type"]
+                    if t == "click":
+                        if a.get("pressed"):
+                            held_buttons.add(a["button"])
+                        else:
+                            held_buttons.discard(a["button"])
+                    elif t == "key_down":
+                        held_keys.add(a["key"])
+                    elif t == "key_up":
+                        held_keys.discard(a["key"])
                 except Exception:
                     pass  # skip a bad/edited action instead of crashing playback
+
+        # Safety net: release anything still "held" no matter how/why we
+        # stopped (aborted mid-click, malformed/edited action list missing
+        # a matching release, etc.) so the mouse/keyboard is never left in a
+        # stuck-down state after playback ends.
+        for btn_name in held_buttons:
+            try:
+                mouse_ctl.release(str_to_button(btn_name))
+            except Exception:
+                pass
+        for key_str in held_keys:
+            try:
+                kb_ctl.release(str_to_key(key_str))
+            except Exception:
+                pass
 
         self.root.after(0, self._finish_playback, aborted)
 
