@@ -222,6 +222,14 @@ def run_gui(payload):
                 set_ime_status(True)
             mouse_ctl = mouse.Controller()
             kb_ctl = keyboard.Controller()
+
+            # Same safety net as the main Recorder app: track anything left
+            # "held down" if playback stops between a press and its matching
+            # release (e.g. ESC right after a click's "down"), and force it
+            # back up afterwards instead of leaving the mouse/key stuck.
+            held_buttons = set()
+            held_keys = set()
+
             for r in range(repeats):
                 if abort_flag.is_set():
                     break
@@ -233,8 +241,30 @@ def run_gui(payload):
                         time.sleep(delay)
                     try:
                         execute_action(a, mouse_ctl, kb_ctl)
+                        t = a["type"]
+                        if t == "click":
+                            if a.get("pressed"):
+                                held_buttons.add(a["button"])
+                            else:
+                                held_buttons.discard(a["button"])
+                        elif t == "key_down":
+                            held_keys.add(a["key"])
+                        elif t == "key_up":
+                            held_keys.discard(a["key"])
                     except Exception:
                         pass
+
+            for btn_name in held_buttons:
+                try:
+                    mouse_ctl.release(str_to_button(btn_name))
+                except Exception:
+                    pass
+            for key_str in held_keys:
+                try:
+                    kb_ctl.release(key_str_to_key(key_str))
+                except Exception:
+                    pass
+
             root.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
