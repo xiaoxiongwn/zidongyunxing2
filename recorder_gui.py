@@ -266,6 +266,7 @@ class MacroApp:
         self.mouse_listener = None
         self.kb_hotkey_listener = None
         self._abort_playback = threading.Event()
+        self._paused = threading.Event()
 
         # snippet ("quick text") support
         self.snippets = load_snippets()          # list of {name, content, hotkey}
@@ -298,6 +299,9 @@ class MacroApp:
         self.btn_play = ttk.Button(toolbar, text="▶ 播放 (F10)", command=self.toggle_playback)
         self.btn_play.pack(side=tk.LEFT, padx=3)
 
+        self.btn_pause = ttk.Button(toolbar, text="⏸ 暂停", command=self.toggle_pause, state=tk.DISABLED)
+        self.btn_pause.pack(side=tk.LEFT, padx=3)
+
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Label(toolbar, text="速度:").pack(side=tk.LEFT)
@@ -317,6 +321,7 @@ class MacroApp:
 
         ttk.Button(toolbar, text="打开", command=self.load_file).pack(side=tk.LEFT, padx=3)
         ttk.Button(toolbar, text="保存", command=self.save_file).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="编辑JSON源码", command=self.open_json_editor).pack(side=tk.LEFT, padx=3)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(toolbar, text="导出独立EXE", command=self.export_standalone_exe).pack(side=tk.LEFT, padx=3)
@@ -352,21 +357,49 @@ class MacroApp:
         ttk.Button(edit_bar, text="插入-最大化窗口", command=self.insert_maximize_window).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="清空全部", command=self.clear_all).pack(side=tk.LEFT, padx=3)
 
+        debug_bar = ttk.Frame(self.root, padding=(6, 0, 6, 6))
+        debug_bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(debug_bar, text="调试: ").pack(side=tk.LEFT)
+        ttk.Button(debug_bar, text="▶ 从选中行开始播放", command=self.play_from_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(debug_bar, text="单独测试选中行", command=self.test_selected_row).pack(side=tk.LEFT, padx=3)
+
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding=4)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def _set_status(self, text):
         self.status_var.set(text)
 
+    def _after_insert(self, pos, label):
+        """Common follow-up after any insert_*: refresh the table, select +
+        scroll to the newly inserted row so it's obvious where it landed,
+        and report the exact row number in the status bar."""
+        self._refresh_table()
+        iid = str(pos)
+        if self.tree.exists(iid):
+            self.tree.selection_set(iid)
+            self.tree.see(iid)
+        self._set_status(f"已插入“{label}”，位于第 {pos + 1} 行（该行已选中高亮）。")
+
     def _show_tree_context_menu(self, event):
-        """Right-click menu on the action table: insert a predefined text
-        snippet directly at the clicked row, no hotkey needed."""
+        """Right-click menu on the action table: lets you insert any action
+        type directly at the row you clicked, so the insertion point is
+        never ambiguous -- it's always right after the row you right-clicked."""
         row = self.tree.identify_row(event.y)
         if row:
             self.tree.selection_set(row)
         pos = int(row) + 1 if row else len(self.actions)
 
         menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="从此行开始播放", command=lambda: self.start_playback(start_index=int(row)) if row else None,
+                          state=tk.NORMAL if row else tk.DISABLED)
+        menu.add_command(label="单独测试此行", command=lambda: self._test_row_at(int(row)) if row else None,
+                          state=tk.NORMAL if row else tk.DISABLED)
+        menu.add_separator()
+        menu.add_command(label="插入等待...", command=lambda: self.insert_wait(pos))
+        menu.add_command(label="插入-设为中文输入法", command=lambda: self.insert_ime_set(True, pos))
+        menu.add_command(label="插入-设为英文输入法", command=lambda: self.insert_ime_set(False, pos))
+        menu.add_command(label="插入-最大化窗口", command=lambda: self.insert_maximize_window(pos))
+        menu.add_separator()
         if self.snippets:
             sub = tk.Menu(menu, tearoff=0)
             for sn in self.snippets:
@@ -383,8 +416,7 @@ class MacroApp:
 
     def _insert_snippet_action(self, snippet, pos):
         self.actions.insert(pos, {"type": "type_text", "text": snippet["content"], "delay_ms": 200})
-        self._refresh_table()
-        self._set_status(f"已插入文本片段“{snippet['name']}”。")
+        self._after_insert(pos, f"文本片段: {snippet['name']}")
 
     def _refresh_table(self):
         self.tree.delete(*self.tree.get_children())
@@ -542,7 +574,7 @@ class MacroApp:
         elif self.mode == "idle":
             self.start_playback()
 
-    def start_playback(self):
+    def start_playback(self, start_index=0):
         if self.mode != "idle":
             return
         if not self.actions:
@@ -550,12 +582,60 @@ class MacroApp:
             return
         self.mode = "playing"
         self._abort_playback.clear()
+        self._paused.clear()
         self.btn_play.config(text="■ 停止 (ESC)")
-        self._set_status("回放中... 按 ESC 立即中止")
-        t = threading.Thread(target=self._playback_worker, daemon=True)
+        self.btn_pause.config(text="⏸ 暂停", state=tk.NORMAL)
+        self._set_status("回放中... 表格里高亮的行就是正在执行的那一步。按 ESC 立即中止")
+        t = threading.Thread(target=self._playback_worker, args=(start_index,), daemon=True)
         t.start()
 
-    def _playback_worker(self):
+    def play_from_selected(self):
+        """Play starting at the selected row instead of from the beginning
+        -- handy when you already know which later step is causing trouble
+        and don't want to sit through everything before it every time."""
+        sel = self._selected_indices()
+        if not sel:
+            messagebox.showinfo(APP_TITLE, "请先在列表里选中要从哪一行开始播放。")
+            return
+        self.start_playback(start_index=sel[0])
+
+    def toggle_pause(self):
+        if self.mode != "playing":
+            return
+        if self._paused.is_set():
+            self._paused.clear()
+            self.btn_pause.config(text="⏸ 暂停")
+            self._set_status("继续播放...")
+        else:
+            self._paused.set()
+            self.btn_pause.config(text="▶ 继续")
+            self._set_status("已暂停 —— 表格里高亮的那一行就是刚执行完/即将执行的动作，可以照着改。")
+
+    def test_selected_row(self):
+        """Immediately execute just the one selected action, right now, with
+        no delay/countdown -- for quickly checking e.g. 'does this click
+        land where I think it does' without replaying the whole macro."""
+        sel = self._selected_indices()
+        if len(sel) != 1:
+            messagebox.showinfo(APP_TITLE, "请只选中一行来单独测试。")
+            return
+        self._test_row_at(sel[0])
+
+    def _test_row_at(self, idx):
+        a = self.actions[idx]
+        try:
+            self._execute_action(a, mouse.Controller(), keyboard.Controller())
+            self._set_status(f"已单独测试第 {idx + 1} 行：{action_summary(a)}")
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"执行这一行时出错: {e}")
+
+    def _highlight_playing_row(self, idx):
+        iid = str(idx)
+        if self.tree.exists(iid):
+            self.tree.selection_set(iid)
+            self.tree.see(iid)
+
+    def _playback_worker(self, start_index=0):
         mouse_ctl = mouse.Controller()
         kb_ctl = keyboard.Controller()
         try:
@@ -574,10 +654,21 @@ class MacroApp:
         for r in range(repeats):
             if aborted:
                 break
-            for a in self.actions:
+            for idx in range(start_index, len(self.actions)):
+                a = self.actions[idx]
                 if self._abort_playback.is_set():
                     aborted = True
                     break
+                while self._paused.is_set():
+                    if self._abort_playback.is_set():
+                        aborted = True
+                        break
+                    time.sleep(0.05)
+                if aborted:
+                    break
+
+                self.root.after(0, self._highlight_playing_row, idx)
+
                 delay = a.get("delay_ms", 0) / 1000.0 / speed
                 if delay > 0:
                     time.sleep(delay)
@@ -624,6 +715,8 @@ class MacroApp:
     def _finish_playback(self, aborted):
         self.mode = "idle"
         self.btn_play.config(text="▶ 播放 (F10)")
+        self.btn_pause.config(text="⏸ 暂停", state=tk.DISABLED)
+        self._paused.clear()
         self._set_status("回放已中止。" if aborted else "回放完成。")
 
     # ----------------------------------------------------------------
@@ -740,38 +833,43 @@ class MacroApp:
             self._refresh_table()
             self.tree.selection_set(str(j))
 
-    def insert_wait(self):
+    def _insertion_pos(self):
+        """Default insertion point when none is explicitly given (e.g. from
+        the toolbar rather than the right-click menu): right after the last
+        selected row, or the end of the list if nothing is selected."""
+        sel = self._selected_indices()
+        return sel[-1] + 1 if sel else len(self.actions)
+
+    def insert_wait(self, pos=None):
         ms = simpledialog.askinteger(APP_TITLE, "插入等待时长 (毫秒):", initialvalue=500, minvalue=0)
         if ms is None:
             return
-        sel = self._selected_indices()
-        pos = sel[-1] + 1 if sel else len(self.actions)
+        if pos is None:
+            pos = self._insertion_pos()
         self.actions.insert(pos, {"type": "wait", "duration_ms": ms, "delay_ms": 0})
-        self._refresh_table()
+        self._after_insert(pos, f"等待 {ms}ms")
 
-    def insert_ime_set(self, open_status):
+    def insert_ime_set(self, open_status, pos=None):
         """Insert a deterministic 'set IME to Chinese/English' action (uses
         the Imm32 API directly instead of simulating Ctrl+Space, and unlike
         a toggle, always ends up in the same state regardless of whatever
         state the IME happened to be in beforehand)."""
-        sel = self._selected_indices()
-        pos = sel[-1] + 1 if sel else len(self.actions)
+        if pos is None:
+            pos = self._insertion_pos()
         self.actions.insert(pos, {"type": "ime_set", "open": bool(open_status), "delay_ms": 200})
-        self._refresh_table()
         label = "中文" if open_status else "英文"
-        self._set_status(f"已插入“设为{label}输入法”动作。")
+        self._after_insert(pos, f"设为{label}输入法")
 
-    def insert_maximize_window(self):
+    def insert_maximize_window(self, pos=None):
         """Insert a 'force-maximize the active window' action -- typically
         placed right after opening a browser/program (with a short wait
         before it so the window has time to appear), so every subsequent
         coordinate-based click lands on a window of a fixed, predictable
         size no matter what size it happened to open at."""
-        sel = self._selected_indices()
-        pos = sel[-1] + 1 if sel else len(self.actions)
+        if pos is None:
+            pos = self._insertion_pos()
         self.actions.insert(pos, {"type": "maximize_window", "delay_ms": 500})
-        self._refresh_table()
-        self._set_status("已插入“最大化当前窗口”动作。建议前面留足等待时间，确保窗口已经打开。")
+        self._after_insert(pos, "最大化当前窗口（建议前面留足等待时间）")
 
     def clear_all(self):
         if self.actions and messagebox.askyesno(APP_TITLE, "确定清空所有动作吗？"):
@@ -988,6 +1086,65 @@ class MacroApp:
             return
         self._refresh_table()
         self._set_status(f"已加载 {path}，共 {len(self.actions)} 个动作")
+
+    def open_json_editor(self):
+        """In-app JSON source editor: view/edit the whole action list as raw
+        JSON text without leaving the program, instead of the old workflow
+        of 保存 -> 用记事本改 -> 打开. Good for bulk edits (search & replace
+        coordinates, multiply all delays, delete/duplicate a block, etc.)."""
+        win = tk.Toplevel(self.root)
+        win.title("编辑JSON源码")
+        win.geometry("680x560")
+        win.grab_set()
+
+        ttk.Label(
+            win,
+            text="直接编辑下面的JSON文本，改完点“应用修改”才会生效。格式有问题会在下方红字提示，"
+                 "不会破坏当前列表。",
+            wraplength=650, justify=tk.LEFT, padding=(8, 8, 8, 0)
+        ).pack(fill=tk.X)
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        text_widget = tk.Text(text_frame, wrap=tk.NONE, font=("Consolas", 10), undo=True)
+        vsb = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=text_widget.yview)
+        hsb = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=text_widget.xview)
+        text_widget.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        text_widget.insert("1.0", json.dumps(self.actions, ensure_ascii=False, indent=2))
+
+        error_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=error_var, foreground="#c0392b",
+                  wraplength=650, justify=tk.LEFT, padding=(8, 0, 8, 0)).pack(fill=tk.X)
+
+        def apply_changes():
+            raw = text_widget.get("1.0", "end-1c")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                error_var.set(f"第 {e.lineno} 行、第 {e.colno} 列附近格式有误：{e.msg}")
+                return
+            if not isinstance(data, list):
+                error_var.set("最外层必须是一个数组，形如 [ {...}, {...} ]。")
+                return
+            for i, item in enumerate(data):
+                if not isinstance(item, dict) or "type" not in item:
+                    error_var.set(f"第 {i + 1} 项不是合法的动作对象（缺少 \"type\" 字段）。")
+                    return
+            self.actions = data
+            self._refresh_table()
+            self._set_status(f"已应用JSON修改，共 {len(self.actions)} 个动作。")
+            win.destroy()
+
+        btn_bar = ttk.Frame(win, padding=(8, 0, 8, 8))
+        btn_bar.pack(fill=tk.X)
+        ttk.Button(btn_bar, text="应用修改", command=apply_changes).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_bar, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=3)
 
     # ----------------------------------------------------------------
     # Export a fully standalone playback exe (no dependency on this app)
