@@ -218,6 +218,47 @@ def str_to_button(s):
     return getattr(Button, s)
 
 
+def compact_move_actions(actions):
+    """Collapse each run of consecutive 'move' actions down to at most its
+    first and last entry (dropping everything in between). The dropped
+    entries' delay_ms is carried forward and added onto the next surviving
+    action, so total elapsed timing before any click/keypress is unchanged
+    -- only the redundant intermediate mouse positions are removed.
+
+    This is safe for the vast majority of macros (clicks/keys/text already
+    carry their own target coordinates and don't depend on the path taken
+    to get there), but can break automations that rely on the mouse
+    visibly traversing a path -- e.g. hover-triggered dropdown menus, or
+    drag operations -- since those need the intermediate positions."""
+    n = len(actions)
+    drop = [False] * n
+    i = 0
+    while i < n:
+        if actions[i]["type"] == "move":
+            j = i
+            while j < n and actions[j]["type"] == "move":
+                j += 1
+            run_len = j - i
+            if run_len > 2:
+                for k in range(i + 1, j - 1):
+                    drop[k] = True
+            i = j
+        else:
+            i += 1
+
+    result = []
+    carried = 0
+    for idx, a in enumerate(actions):
+        if drop[idx]:
+            carried += a.get("delay_ms", 0)
+            continue
+        new_a = dict(a)
+        new_a["delay_ms"] = new_a.get("delay_ms", 0) + carried
+        carried = 0
+        result.append(new_a)
+    return result
+
+
 def action_summary(a):
     """Human readable one-line summary for the table's 'Details' column."""
     t = a["type"]
@@ -322,6 +363,13 @@ class MacroApp:
         ttk.Button(toolbar, text="打开", command=self.load_file).pack(side=tk.LEFT, padx=3)
         ttk.Button(toolbar, text="保存", command=self.save_file).pack(side=tk.LEFT, padx=3)
         ttk.Button(toolbar, text="编辑JSON源码", command=self.open_json_editor).pack(side=tk.LEFT, padx=3)
+
+        compact_bar = ttk.Frame(self.root, padding=(6, 0, 6, 6))
+        compact_bar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(compact_bar, text="精简鼠标移动记录", command=self.do_compact_moves).pack(side=tk.LEFT, padx=3)
+        self.auto_compact_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(compact_bar, text="录制结束后自动精简移动记录",
+                         variable=self.auto_compact_var).pack(side=tk.LEFT, padx=(10, 0))
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(toolbar, text="导出独立EXE", command=self.export_standalone_exe).pack(side=tk.LEFT, padx=3)
@@ -516,8 +564,46 @@ class MacroApp:
             self.mouse_listener.stop()
             self.mouse_listener = None
         self.btn_record.config(text="● 开始录制 (Ctrl+Alt+Shift+R)")
+
+        if self.auto_compact_var.get() and self.actions:
+            before = len(self.actions)
+            self.actions = compact_move_actions(self.actions)
+            after = len(self.actions)
+            self._refresh_table()
+            self._set_status(f"录制完成并已自动精简：{before} 条 → {after} 条。")
+        else:
+            self._refresh_table()
+            self._set_status(f"录制完成，共 {len(self.actions)} 个动作。")
+
+    def do_compact_moves(self):
+        """Manually trigger move-record compaction on whatever is currently
+        loaded -- a fresh recording, or an old .json file you just opened."""
+        if not self.actions:
+            messagebox.showinfo(APP_TITLE, "动作列表是空的，没什么可以精简的。")
+            return
+        before = len(self.actions)
+        candidate = compact_move_actions(self.actions)
+        after = len(candidate)
+        removed = before - after
+        if removed <= 0:
+            messagebox.showinfo(APP_TITLE, "没有可以精简的连续鼠标移动记录（已经是精简过的了，或者本来移动记录就不多）。")
+            return
+        ok = messagebox.askyesno(
+            APP_TITLE,
+            f"当前共 {before} 条动作，精简后会变成 {after} 条（删掉 {removed} 条中间的鼠标移动记录）。\n\n"
+            "规则：每一段连续的鼠标移动，只保留紧挨着点击/按键动作前、后各一条，中间的全部删除；"
+            "被删掉的等待时间会累加到旁边保留的那一条上，不影响后续动作的整体时机。\n\n"
+            "点击动作自带最终坐标，不依赖中间移动记录，所以一般不影响点击准确性。"
+            "但如果某些操作依赖鼠标划过路径触发效果（网页悬停菜单、拖拽等），精简后可能会失效，"
+            "建议精简后先测试播放确认一遍。\n\n"
+            "这一步只改动当前编辑器里的内容，点“保存”之前不会碰你硬盘上的文件，可以放心试。\n\n"
+            "确定要精简吗？"
+        )
+        if not ok:
+            return
+        self.actions = candidate
         self._refresh_table()
-        self._set_status(f"录制完成，共 {len(self.actions)} 个动作。")
+        self._set_status(f"已精简：{before} 条 → {after} 条（删掉了 {removed} 条移动记录）。记得点“保存”写回文件。")
 
     def _elapsed_ms(self):
         now = time.perf_counter()
