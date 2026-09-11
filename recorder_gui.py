@@ -317,6 +317,7 @@ class MacroApp:
         self._mod_shift = False
         self._swallow_next_release = set()
         self._snippet_popup = None                # the on-screen quick-pick panel, if open
+        self._snippet_popup_target_hwnd = None    # window to restore focus to before typing
 
         self.speed_var = tk.DoubleVar(value=1.0)
         self.repeat_var = tk.IntVar(value=1)
@@ -651,7 +652,16 @@ class MacroApp:
         # alongside it, without touching/suppressing Windows' own menu.
         if (button == Button.right and pressed
                 and self.recording_right_click_var.get() and self.snippets):
-            self.root.after(0, self._show_recording_snippet_popup, x, y)
+            # Capture which window currently has focus RIGHT NOW, before our
+            # own popup steals it -- we need to restore focus to this window
+            # before typing, or the text goes nowhere useful.
+            target_hwnd = None
+            if sys.platform == "win32":
+                try:
+                    target_hwnd = ctypes.windll.user32.GetForegroundWindow()
+                except Exception:
+                    target_hwnd = None
+            self.root.after(0, self._show_recording_snippet_popup, x, y, target_hwnd)
 
     def _on_mouse_scroll(self, x, y, dx, dy):
         if self.mode != "recording":
@@ -661,7 +671,7 @@ class MacroApp:
             "delay_ms": self._elapsed_ms(),
         })
 
-    def _show_recording_snippet_popup(self, x, y):
+    def _show_recording_snippet_popup(self, x, y, target_hwnd):
         """Small borderless always-on-top panel offering snippets, shown
         next to the cursor right after a right-click DURING RECORDING.
         This is purely additive -- it never blocks/suppresses Windows'
@@ -675,6 +685,8 @@ class MacroApp:
             except Exception:
                 pass
             self._snippet_popup = None
+
+        self._snippet_popup_target_hwnd = target_hwnd
 
         popup = tk.Toplevel(self.root)
         self._snippet_popup = popup
@@ -702,8 +714,9 @@ class MacroApp:
         popup.focus_force()
 
     def _pick_snippet_from_popup(self, snippet):
+        target_hwnd = self._snippet_popup_target_hwnd
         self._close_snippet_popup()
-        self._trigger_snippet(snippet)
+        self._trigger_snippet(snippet, target_hwnd=target_hwnd)
 
     def _close_snippet_popup(self):
         if self._snippet_popup is not None:
@@ -1224,7 +1237,7 @@ class MacroApp:
             return None
         return "+".join(mods + [main])
 
-    def _trigger_snippet(self, snippet):
+    def _trigger_snippet(self, snippet, target_hwnd=None):
         text = snippet["content"]
         if self.mode == "recording":
             self.actions.append({"type": "type_text", "text": text, "delay_ms": self._elapsed_ms()})
@@ -1232,6 +1245,20 @@ class MacroApp:
             self.root.after(0, self._set_status, f"已插入文本片段“{snippet['name']}”并正在输入...")
 
         def worker():
+            # If this came from the right-click popup, clicking that popup's
+            # button just moved keyboard focus to OUR window -- switch focus
+            # back to whatever window you were actually working in first, or
+            # the text would get typed into our own popup instead of your
+            # target app. (Not needed for the hotkey path: pressing a hotkey
+            # never involves clicking one of our windows, so focus never
+            # left your target app in the first place -- target_hwnd is
+            # None there and this is skipped.)
+            if target_hwnd and sys.platform == "win32":
+                try:
+                    ctypes.windll.user32.SetForegroundWindow(target_hwnd)
+                    time.sleep(0.08)  # give Windows a moment to switch focus
+                except Exception:
+                    pass
             try:
                 keyboard.Controller().type(text)
             except Exception:
