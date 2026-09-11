@@ -316,6 +316,7 @@ class MacroApp:
         self._mod_alt = False
         self._mod_shift = False
         self._swallow_next_release = set()
+        self._snippet_popup = None                # the on-screen quick-pick panel, if open
 
         self.speed_var = tk.DoubleVar(value=1.0)
         self.repeat_var = tk.IntVar(value=1)
@@ -376,6 +377,9 @@ class MacroApp:
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(toolbar, text="文本片段管理", command=self.open_snippet_manager).pack(side=tk.LEFT, padx=3)
+        self.recording_right_click_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="录制时右键弹出片段面板",
+                         variable=self.recording_right_click_var).pack(side=tk.LEFT, padx=(6, 0))
 
         # --- editable table ---
         columns = ("idx", "type", "details", "delay")
@@ -642,6 +646,12 @@ class MacroApp:
             "button": button_to_str(button), "pressed": pressed,
             "delay_ms": self._elapsed_ms(),
         })
+        # Right-click still gets recorded normally (above) so it replays
+        # correctly -- this just ALSO offers a snippet quick-pick panel
+        # alongside it, without touching/suppressing Windows' own menu.
+        if (button == Button.right and pressed
+                and self.recording_right_click_var.get() and self.snippets):
+            self.root.after(0, self._show_recording_snippet_popup, x, y)
 
     def _on_mouse_scroll(self, x, y, dx, dy):
         if self.mode != "recording":
@@ -650,6 +660,58 @@ class MacroApp:
             "type": "scroll", "x": x, "y": y, "dx": dx, "dy": dy,
             "delay_ms": self._elapsed_ms(),
         })
+
+    def _show_recording_snippet_popup(self, x, y):
+        """Small borderless always-on-top panel offering snippets, shown
+        next to the cursor right after a right-click DURING RECORDING.
+        This is purely additive -- it never blocks/suppresses Windows'
+        own right-click menu, which still opens normally underneath/beside
+        it. Ignore it (click elsewhere, Esc, or just wait) and it auto-
+        closes on its own, leaving your normal right-click workflow
+        completely untouched."""
+        if self._snippet_popup is not None:
+            try:
+                self._snippet_popup.destroy()
+            except Exception:
+                pass
+            self._snippet_popup = None
+
+        popup = tk.Toplevel(self.root)
+        self._snippet_popup = popup
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        # Offset from the exact cursor spot so it doesn't sit fully under
+        # wherever Windows draws its own context menu.
+        popup.geometry(f"+{x + 50}+{y + 15}")
+
+        frame = ttk.Frame(popup, relief=tk.RAISED, borderwidth=1)
+        frame.pack()
+        ttk.Label(frame, text="插入文本片段（不影响原右键菜单）", padding=(6, 4),
+                  font=("Segoe UI", 9, "bold")).pack(fill=tk.X)
+        for sn in self.snippets:
+            label = sn["name"]
+            if sn.get("hotkey"):
+                label += f"  ({sn['hotkey']})"
+            tk.Button(frame, text=label, anchor="w", relief=tk.FLAT,
+                      command=lambda sn=sn: self._pick_snippet_from_popup(sn)
+                      ).pack(fill=tk.X, padx=2, pady=1)
+        ttk.Button(frame, text="关闭", command=self._close_snippet_popup).pack(fill=tk.X, padx=2, pady=(4, 2))
+
+        popup.bind("<FocusOut>", lambda e: self._close_snippet_popup())
+        popup.after(5000, self._close_snippet_popup)  # auto-dismiss if ignored
+        popup.focus_force()
+
+    def _pick_snippet_from_popup(self, snippet):
+        self._close_snippet_popup()
+        self._trigger_snippet(snippet)
+
+    def _close_snippet_popup(self):
+        if self._snippet_popup is not None:
+            try:
+                self._snippet_popup.destroy()
+            except Exception:
+                pass
+            self._snippet_popup = None
 
     # ----------------------------------------------------------------
     # Playback
