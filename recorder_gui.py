@@ -49,6 +49,40 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
+    # --- Declare correct argument/return types for the win32 calls we use -
+    # By default ctypes assumes every WinAPI function takes/returns a 32-bit
+    # C int. Window handles (HWND) are actually pointer-sized. On 64-bit
+    # Windows this mismatch SILENTLY truncates/corrupts handle values --
+    # no exception is raised, a handle just quietly becomes the wrong one.
+    # This is what broke "restore focus to the window you right-clicked in"
+    # for the snippet popup: the captured handle was already wrong by the
+    # time we tried to use it. Fixing the signatures once here, up front,
+    # makes every handle-passing call below use the correct pointer width.
+    try:
+        _user32 = ctypes.windll.user32
+        _user32.GetForegroundWindow.restype = ctypes.c_void_p
+        _user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        _user32.SetForegroundWindow.restype = ctypes.c_int
+        _user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _user32.ShowWindow.restype = ctypes.c_int
+        _user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+        _user32.AttachThreadInput.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
+        _user32.AttachThreadInput.restype = ctypes.c_int
+
+        _kernel32 = ctypes.windll.kernel32
+        _kernel32.GetCurrentThreadId.restype = ctypes.c_uint32
+
+        _imm32 = ctypes.windll.imm32
+        _imm32.ImmGetContext.argtypes = [ctypes.c_void_p]
+        _imm32.ImmGetContext.restype = ctypes.c_void_p
+        _imm32.ImmReleaseContext.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _imm32.ImmSetOpenStatus.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _imm32.ImmGetOpenStatus.argtypes = [ctypes.c_void_p]
+        _imm32.ImmGetOpenStatus.restype = ctypes.c_int
+    except Exception:
+        pass
+
 from pynput import mouse, keyboard
 from pynput.keyboard import Key, KeyCode
 from pynput.mouse import Button
@@ -127,6 +161,47 @@ def maximize_foreground_window():
         ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
     except Exception:
         pass
+
+
+def get_foreground_window():
+    """GetForegroundWindow with the correct (pointer-sized) return type --
+    see the signature-fixup block near the top of this file for why that
+    matters."""
+    if sys.platform != "win32":
+        return None
+    try:
+        return ctypes.windll.user32.GetForegroundWindow()
+    except Exception:
+        return None
+
+
+def set_foreground_window(hwnd):
+    """Robustly bring hwnd to the foreground. A plain SetForegroundWindow
+    call can silently be refused by Windows' foreground-lock restriction
+    (it only lets a process steal focus under specific conditions). If the
+    direct call doesn't work, fall back to the standard workaround: attach
+    our thread's input queue to the target window's thread with
+    AttachThreadInput, retry, then detach. Returns True/False for whether
+    it appears to have worked."""
+    if not hwnd or sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        if user32.SetForegroundWindow(hwnd):
+            return True
+
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        current_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        if target_tid and target_tid != current_tid:
+            user32.AttachThreadInput(current_tid, target_tid, True)
+            try:
+                result = user32.SetForegroundWindow(hwnd)
+            finally:
+                user32.AttachThreadInput(current_tid, target_tid, False)
+            return bool(result)
+        return False
+    except Exception:
+        return False
 
 
 def resource_path(relative):
@@ -655,12 +730,7 @@ class MacroApp:
             # Capture which window currently has focus RIGHT NOW, before our
             # own popup steals it -- we need to restore focus to this window
             # before typing, or the text goes nowhere useful.
-            target_hwnd = None
-            if sys.platform == "win32":
-                try:
-                    target_hwnd = ctypes.windll.user32.GetForegroundWindow()
-                except Exception:
-                    target_hwnd = None
+            target_hwnd = get_foreground_window()
             self.root.after(0, self._show_recording_snippet_popup, x, y, target_hwnd)
 
     def _on_mouse_scroll(self, x, y, dx, dy):
@@ -1253,12 +1323,13 @@ class MacroApp:
             # never involves clicking one of our windows, so focus never
             # left your target app in the first place -- target_hwnd is
             # None there and this is skipped.)
-            if target_hwnd and sys.platform == "win32":
-                try:
-                    ctypes.windll.user32.SetForegroundWindow(target_hwnd)
-                    time.sleep(0.08)  # give Windows a moment to switch focus
-                except Exception:
-                    pass
+            if target_hwnd:
+                ok = set_foreground_window(target_hwnd)
+                if not ok:
+                    self.root.after(0, self._set_status,
+                                     "没能自动切回目标窗口，请手动点一下目标窗口再试这个片段。")
+                    return
+                time.sleep(0.08)  # give Windows a moment to actually switch focus
             try:
                 keyboard.Controller().type(text)
             except Exception:
