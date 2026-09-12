@@ -47,6 +47,26 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
+    # Declare correct (pointer-sized) argument/return types for the win32
+    # handle-passing calls below -- ctypes defaults to 32-bit int, which can
+    # silently corrupt window handles on 64-bit Windows. See the matching
+    # block in recorder_gui.py for the full explanation.
+    try:
+        _user32 = ctypes.windll.user32
+        _user32.GetForegroundWindow.restype = ctypes.c_void_p
+        _user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _user32.ShowWindow.restype = ctypes.c_int
+
+        _imm32 = ctypes.windll.imm32
+        _imm32.ImmGetContext.argtypes = [ctypes.c_void_p]
+        _imm32.ImmGetContext.restype = ctypes.c_void_p
+        _imm32.ImmReleaseContext.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _imm32.ImmSetOpenStatus.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _imm32.ImmGetOpenStatus.argtypes = [ctypes.c_void_p]
+        _imm32.ImmGetOpenStatus.restype = ctypes.c_int
+    except Exception:
+        pass
+
 from pynput import mouse, keyboard
 from pynput.keyboard import Key, KeyCode
 from pynput.mouse import Button
