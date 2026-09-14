@@ -392,6 +392,7 @@ class MacroApp:
         self._mod_shift = False
         self._swallow_next_release = set()
         self._active_hotkey_keys = set()   # keys currently held that already fired a hotkey action
+        self._suppress_key_recording = threading.Event()  # True while we're injecting a snippet's own text
         self._snippet_popup = None                # the on-screen quick-pick panel, if open
         self._snippet_popup_target_hwnd = None    # window to restore focus to before typing
 
@@ -566,7 +567,7 @@ class MacroApp:
             elif key in (Key.shift, Key.shift_r):
                 self._mod_shift = True
             else:
-                combo = self._live_combo(key)
+                combo = None if self._suppress_key_recording.is_set() else self._live_combo(key)
                 is_hotkey = (
                     combo == RECORD_START_HOTKEY
                     or combo == RECORD_STOP_HOTKEY
@@ -599,7 +600,12 @@ class MacroApp:
                 if key == Key.f10:
                     self.root.after(0, self.start_playback)
             elif self.mode == "recording":
-                self._record_key_event(key, True)
+                # Don't record keystrokes WE ourselves are currently
+                # injecting to type out a snippet's text -- our own global
+                # hook sees those too, indistinguishable from real typing,
+                # unless we explicitly tell it to ignore this window of time.
+                if not self._suppress_key_recording.is_set():
+                    self._record_key_event(key, True)
             elif self.mode == "playing":
                 if key == Key.esc:
                     self._abort_playback.set()
@@ -619,7 +625,8 @@ class MacroApp:
                 return
 
             if self.mode == "recording":
-                self._record_key_event(key, False)
+                if not self._suppress_key_recording.is_set():
+                    self._record_key_event(key, False)
 
         self.kb_hotkey_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self.kb_hotkey_listener.start()
@@ -1361,10 +1368,32 @@ class MacroApp:
                                      "没能自动切回目标窗口，请手动点一下目标窗口再试这个片段。")
                     return
                 time.sleep(0.08)  # give Windows a moment to actually switch focus
+
+            # Our own global keyboard hook is always running (it's what
+            # detects hotkeys and records your real typing), and it can't
+            # tell "real keystroke" apart from "keystroke our own
+            # Controller.type() just injected" -- without this flag, the
+            # characters we're about to type get picked up a SECOND time as
+            # raw key_down/key_up actions on top of the type_text action
+            # already added above, and both replay on playback (that's the
+            # "typed twice" bug). Tell the hook to ignore keys for the
+            # duration of the injection.
+            self._suppress_key_recording.set()
             try:
                 keyboard.Controller().type(text)
             except Exception:
                 pass
+            finally:
+                # Generous grace period, scaled with how much text there
+                # was: injected events can lag noticeably behind type()
+                # returning before they actually reach the low-level hook
+                # (they queue through the OS input pipeline), and a longer
+                # string means more trailing events that could still be
+                # in flight. Better to hold suppression a bit too long
+                # (worst case: a real keystroke typed in the same instant
+                # gets missed, which is rare) than too short.
+                time.sleep(min(1.0, max(0.2, 0.06 * len(text))))
+                self._suppress_key_recording.clear()
 
         threading.Thread(target=worker, daemon=True).start()
 
