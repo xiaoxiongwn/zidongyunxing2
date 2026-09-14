@@ -391,6 +391,7 @@ class MacroApp:
         self._mod_alt = False
         self._mod_shift = False
         self._swallow_next_release = set()
+        self._active_hotkey_keys = set()   # keys currently held that already fired a hotkey action
         self._snippet_popup = None                # the on-screen quick-pick panel, if open
         self._snippet_popup_target_hwnd = None    # window to restore focus to before typing
 
@@ -566,19 +567,32 @@ class MacroApp:
                 self._mod_shift = True
             else:
                 combo = self._live_combo(key)
-                if combo == RECORD_START_HOTKEY:
+                is_hotkey = (
+                    combo == RECORD_START_HOTKEY
+                    or combo == RECORD_STOP_HOTKEY
+                    or (self.mode in ("idle", "recording") and combo and combo in self.hotkey_map)
+                )
+                if is_hotkey:
                     self._swallow_next_release.add(key)
-                    if self.mode == "idle":
-                        self.root.after(0, self.start_recording)
-                    return
-                if combo == RECORD_STOP_HOTKEY:
-                    self._swallow_next_release.add(key)
-                    if self.mode == "recording":
-                        self.root.after(0, self.stop_recording)
-                    return
-                if self.mode in ("idle", "recording") and combo and combo in self.hotkey_map:
-                    self._swallow_next_release.add(key)
-                    self.root.after(0, self._trigger_snippet, self.hotkey_map[combo])
+                    # Windows' OS-level key-repeat fires on_press again and
+                    # again for as long as you hold the key down (same as
+                    # how a held key spams characters while typing) -- with
+                    # no guard here, holding a hotkey even slightly too long
+                    # triggers the snippet/record-toggle multiple times in a
+                    # row. Only act on the FIRST press; ignore repeats until
+                    # the key is actually released.
+                    if key in self._active_hotkey_keys:
+                        return
+                    self._active_hotkey_keys.add(key)
+
+                    if combo == RECORD_START_HOTKEY:
+                        if self.mode == "idle":
+                            self.root.after(0, self.start_recording)
+                    elif combo == RECORD_STOP_HOTKEY:
+                        if self.mode == "recording":
+                            self.root.after(0, self.stop_recording)
+                    else:
+                        self.root.after(0, self._trigger_snippet, self.hotkey_map[combo])
                     return
 
             if self.mode == "idle":
@@ -597,6 +611,8 @@ class MacroApp:
                 self._mod_alt = False
             elif key in (Key.shift, Key.shift_r):
                 self._mod_shift = False
+
+            self._active_hotkey_keys.discard(key)
 
             if key in self._swallow_next_release:
                 self._swallow_next_release.discard(key)
@@ -725,13 +741,23 @@ class MacroApp:
         # Right-click still gets recorded normally (above) so it replays
         # correctly -- this just ALSO offers a snippet quick-pick panel
         # alongside it, without touching/suppressing Windows' own menu.
-        if (button == Button.right and pressed
+        #
+        # Trigger on RELEASE, not press, and with a short delay: Windows'
+        # own context menu is drawn on button-UP and is a special shell-
+        # level popup that renders above pretty much everything, even our
+        # "topmost" window. If we show our panel on button-DOWN (before the
+        # native menu exists yet), the native menu appears afterward and
+        # visually buries our panel underneath it -- it's technically still
+        # there, just hidden. Waiting until just after release, once the
+        # native menu has had a moment to actually appear, means our panel
+        # gets created (and drawn) after it, landing on top instead.
+        if (button == Button.right and not pressed
                 and self.recording_right_click_var.get() and self.snippets):
             # Capture which window currently has focus RIGHT NOW, before our
             # own popup steals it -- we need to restore focus to this window
             # before typing, or the text goes nowhere useful.
             target_hwnd = get_foreground_window()
-            self.root.after(0, self._show_recording_snippet_popup, x, y, target_hwnd)
+            self.root.after(180, self._show_recording_snippet_popup, x, y, target_hwnd)
 
     def _on_mouse_scroll(self, x, y, dx, dy):
         if self.mode != "recording":
@@ -748,7 +774,10 @@ class MacroApp:
         own right-click menu, which still opens normally underneath/beside
         it. Ignore it (click elsewhere, Esc, or just wait) and it auto-
         closes on its own, leaving your normal right-click workflow
-        completely untouched."""
+        completely untouched. If it happens to visually overlap the native
+        menu and you want to click something under it, just press Esc to
+        dismiss this panel -- the native menu keeps running underneath,
+        completely unaffected, and becomes clickable again immediately."""
         if self._snippet_popup is not None:
             try:
                 self._snippet_popup.destroy()
@@ -762,13 +791,14 @@ class MacroApp:
         self._snippet_popup = popup
         popup.overrideredirect(True)
         popup.attributes("-topmost", True)
-        # Offset from the exact cursor spot so it doesn't sit fully under
-        # wherever Windows draws its own context menu.
-        popup.geometry(f"+{x + 50}+{y + 15}")
+        # Offset further from the exact cursor spot to reduce the odds of
+        # sitting on top of wherever Windows draws its own context menu
+        # (can't guarantee zero overlap -- native menu size varies).
+        popup.geometry(f"+{x + 90}+{y + 15}")
 
         frame = ttk.Frame(popup, relief=tk.RAISED, borderwidth=1)
         frame.pack()
-        ttk.Label(frame, text="插入文本片段（不影响原右键菜单）", padding=(6, 4),
+        ttk.Label(frame, text="插入文本片段（Esc可关闭，不影响原右键菜单）", padding=(6, 4),
                   font=("Segoe UI", 9, "bold")).pack(fill=tk.X)
         for sn in self.snippets:
             label = sn["name"]
@@ -777,9 +807,10 @@ class MacroApp:
             tk.Button(frame, text=label, anchor="w", relief=tk.FLAT,
                       command=lambda sn=sn: self._pick_snippet_from_popup(sn)
                       ).pack(fill=tk.X, padx=2, pady=1)
-        ttk.Button(frame, text="关闭", command=self._close_snippet_popup).pack(fill=tk.X, padx=2, pady=(4, 2))
+        ttk.Button(frame, text="关闭 (Esc)", command=self._close_snippet_popup).pack(fill=tk.X, padx=2, pady=(4, 2))
 
         popup.bind("<FocusOut>", lambda e: self._close_snippet_popup())
+        popup.bind("<Escape>", lambda e: self._close_snippet_popup())
         popup.after(5000, self._close_snippet_popup)  # auto-dismiss if ignored
         popup.focus_force()
 
