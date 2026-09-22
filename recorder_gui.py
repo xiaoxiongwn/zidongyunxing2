@@ -334,6 +334,94 @@ def compact_move_actions(actions):
     return result
 
 
+def circled_number(n):
+    """Unicode circled digit for 1-50 (①...㊿); beyond that, no such glyph
+    exists in Unicode, so fall back to a plain "(51)" style that keeps the
+    same "enclosed number" visual idea without needing an actual glyph."""
+    if 1 <= n <= 20:
+        return chr(0x2460 + (n - 1))
+    if 21 <= n <= 35:
+        return chr(0x3251 + (n - 21))
+    if 36 <= n <= 50:
+        return chr(0x32B1 + (n - 36))
+    return f"({n})"
+
+
+DOUBLE_CLICK_GAP_MS = 500   # matches the usual Windows double-click time window
+DOUBLE_CLICK_MAX_DIST = 4   # px -- how close together the two clicks must land
+
+
+def compute_click_markers(actions):
+    """For display only (never written back into the saved data): figure
+    out which click actions belong to which "click event", and return a
+    {action_index: marker_string} map so the table can show a running,
+    easy-to-scan number next to every click -- plain "1 2 3..." for single
+    left clicks, circled "① ② ③..." for right clicks, and triangled
+    "▲1 ▲2 ▲3..." for left double-clicks (both press and release of a
+    click share the same marker, so a click's two rows are easy to spot
+    as a pair)."""
+    n = len(actions)
+
+    # Step 1: pair up each press with its matching release.
+    events = []
+    i = 0
+    while i < n:
+        a = actions[i]
+        if a.get("type") == "click" and a.get("pressed"):
+            button = a.get("button")
+            release_idx = None
+            j = i + 1
+            while j < n:
+                b = actions[j]
+                if b.get("type") == "click" and b.get("button") == button:
+                    if not b.get("pressed"):
+                        release_idx = j
+                    break  # next click of this button (press or release) ends the search
+                j += 1
+            events.append({"press": i, "release": release_idx, "button": button,
+                            "x": a.get("x"), "y": a.get("y")})
+        i += 1
+
+    # Step 2: group consecutive LEFT click events into double-clicks when
+    # they land close together, close in time, right after one another.
+    grouped = []
+    idx = 0
+    while idx < len(events):
+        ev = events[idx]
+        if ev["button"] == "left" and ev["release"] is not None and idx + 1 < len(events):
+            nxt = events[idx + 1]
+            if (nxt["button"] == "left"
+                    and abs(nxt["x"] - ev["x"]) <= DOUBLE_CLICK_MAX_DIST
+                    and abs(nxt["y"] - ev["y"]) <= DOUBLE_CLICK_MAX_DIST):
+                gap = sum(actions[k].get("delay_ms", 0)
+                          for k in range(ev["release"] + 1, nxt["press"] + 1))
+                if gap <= DOUBLE_CLICK_GAP_MS:
+                    grouped.append(("double", [ev, nxt]))
+                    idx += 2
+                    continue
+        grouped.append(("left" if ev["button"] == "left" else "other", [ev]))
+        idx += 1
+
+    # Step 3: assign running numbers per category and mark press+release rows.
+    markers = {}
+    left_n = right_n = dbl_n = 0
+    for kind, evs in grouped:
+        if kind == "double":
+            dbl_n += 1
+            marker = f"▲{dbl_n}"
+        elif kind == "left":
+            left_n += 1
+            marker = str(left_n)
+        else:
+            right_n += 1
+            marker = circled_number(right_n)
+        for ev in evs:
+            markers[ev["press"]] = marker
+            if ev["release"] is not None:
+                markers[ev["release"]] = marker
+    return markers
+
+
 def action_summary(a):
     """Human readable one-line summary for the table's 'Details' column."""
     t = a["type"]
@@ -460,6 +548,12 @@ class MacroApp:
                          variable=self.recording_right_click_var).pack(side=tk.LEFT, padx=(6, 0))
 
         # --- editable table ---
+        legend = ttk.Label(
+            self.root,
+            text="点击编号说明： 1 2 3...=左键单击   ① ② ③...=右键点击   ▲1 ▲2...=左键双击",
+            padding=(6, 2), foreground="#555")
+        legend.pack(side=tk.TOP, fill=tk.X)
+
         columns = ("idx", "type", "details", "delay")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="extended")
         self.tree.heading("idx", text="#")
@@ -550,9 +644,14 @@ class MacroApp:
 
     def _refresh_table(self):
         self.tree.delete(*self.tree.get_children())
+        markers = compute_click_markers(self.actions)
         for i, a in enumerate(self.actions):
+            summary = action_summary(a)
+            marker = markers.get(i)
+            if marker:
+                summary = f"{marker}  {summary}"
             self.tree.insert("", tk.END, iid=str(i),
-                              values=(i + 1, a["type"], action_summary(a), a.get("delay_ms", 0)))
+                              values=(i + 1, a["type"], summary, a.get("delay_ms", 0)))
 
     # ----------------------------------------------------------------
     # Global hotkey listener (always running: Ctrl+Alt+Shift+R/P, F10, ESC)
