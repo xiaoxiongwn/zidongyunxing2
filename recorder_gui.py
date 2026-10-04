@@ -555,7 +555,10 @@ class MacroApp:
         legend.pack(side=tk.TOP, fill=tk.X)
 
         columns = ("idx", "type", "details", "delay")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="extended")
+        tree_frame = ttk.Frame(self.root)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
         self.tree.heading("idx", text="#")
         self.tree.heading("type", text="类型")
         self.tree.heading("details", text="详情")
@@ -564,7 +567,12 @@ class MacroApp:
         self.tree.column("type", width=90, anchor=tk.CENTER)
         self.tree.column("details", width=380)
         self.tree.column("delay", width=90, anchor=tk.CENTER)
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        tree_vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
         self.tree.bind("<Double-1>", lambda e: self.edit_selected_row())
         self.tree.bind("<Button-3>", self._show_tree_context_menu)
 
@@ -576,6 +584,7 @@ class MacroApp:
         ttk.Button(edit_bar, text="上移", command=lambda: self.move_selected(-1)).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="下移", command=lambda: self.move_selected(1)).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="插入等待", command=self.insert_wait).pack(side=tk.LEFT, padx=3)
+        ttk.Button(edit_bar, text="插入鼠标点击", command=self.insert_click_action).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="插入-设为中文", command=lambda: self.insert_ime_set(True)).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="插入-设为英文", command=lambda: self.insert_ime_set(False)).pack(side=tk.LEFT, padx=3)
         ttk.Button(edit_bar, text="插入-最大化窗口", command=self.insert_maximize_window).pack(side=tk.LEFT, padx=3)
@@ -620,6 +629,7 @@ class MacroApp:
                           state=tk.NORMAL if row else tk.DISABLED)
         menu.add_separator()
         menu.add_command(label="插入等待...", command=lambda: self.insert_wait(pos))
+        menu.add_command(label="插入鼠标点击...", command=lambda: self.insert_click_action(pos))
         menu.add_command(label="插入-设为中文输入法", command=lambda: self.insert_ime_set(True, pos))
         menu.add_command(label="插入-设为英文输入法", command=lambda: self.insert_ime_set(False, pos))
         menu.add_command(label="插入-最大化窗口", command=lambda: self.insert_maximize_window(pos))
@@ -1270,6 +1280,118 @@ class MacroApp:
             pos = self._insertion_pos()
         self.actions.insert(pos, {"type": "maximize_window", "delay_ms": 500})
         self._after_insert(pos, "最大化当前窗口（建议前面留足等待时间）")
+
+    def insert_click_action(self, pos=None):
+        """Insert a manually-specified mouse click (single or double,
+        left/right/middle) at a chosen position -- for adding a click that
+        wasn't recorded, or that you want full control over the parameters
+        of, without having to re-record anything."""
+        if pos is None:
+            pos = self._insertion_pos()
+        params = self._click_insert_dialog()
+        if params is None:
+            return
+
+        x, y = params["x"], params["y"]
+        button = params["button"]
+        new_actions = [
+            {"type": "click", "x": x, "y": y, "button": button, "pressed": True,
+             "delay_ms": params["before_delay"]},
+            {"type": "click", "x": x, "y": y, "button": button, "pressed": False,
+             "delay_ms": params["press_release_gap"]},
+        ]
+        if params["double"]:
+            new_actions += [
+                {"type": "click", "x": x, "y": y, "button": button, "pressed": True,
+                 "delay_ms": params["between_gap"]},
+                {"type": "click", "x": x, "y": y, "button": button, "pressed": False,
+                 "delay_ms": params["press_release_gap"]},
+            ]
+
+        for offset, a in enumerate(new_actions):
+            self.actions.insert(pos + offset, a)
+
+        button_label = {"left": "左键", "right": "右键", "middle": "中键"}.get(button, button)
+        kind_label = "双击" if params["double"] else "单击"
+        self._after_insert(pos, f"{kind_label}{button_label} @ ({x}, {y})")
+
+    def _click_insert_dialog(self):
+        """Dialog for insert_click_action. Returns a params dict, or None
+        if cancelled. X/Y default to the mouse's actual current on-screen
+        position, since that's usually the easiest way to grab a coordinate
+        -- move the real cursor to the target spot first, then open this
+        dialog."""
+        win = tk.Toplevel(self.root)
+        win.title("插入鼠标点击")
+        win.grab_set()
+        win.resizable(False, False)
+
+        try:
+            cur_x, cur_y = mouse.Controller().position
+        except Exception:
+            cur_x, cur_y = 0, 0
+
+        row = 0
+
+        def add_entry(label_text, var):
+            nonlocal row
+            ttk.Label(win, text=label_text).grid(row=row, column=0, sticky=tk.W, padx=8, pady=4)
+            ttk.Entry(win, textvariable=var, width=20).grid(row=row, column=1, padx=8, pady=4)
+            row += 1
+
+        x_var = tk.StringVar(value=str(cur_x))
+        y_var = tk.StringVar(value=str(cur_y))
+        add_entry("X 坐标 (默认=当前鼠标位置):", x_var)
+        add_entry("Y 坐标:", y_var)
+
+        ttk.Label(win, text="按钮:").grid(row=row, column=0, sticky=tk.W, padx=8, pady=4)
+        button_var = tk.StringVar(value="left")
+        ttk.Combobox(win, textvariable=button_var, values=["left", "right", "middle"],
+                     state="readonly", width=18).grid(row=row, column=1, padx=8, pady=4)
+        row += 1
+
+        ttk.Label(win, text="类型:").grid(row=row, column=0, sticky=tk.W, padx=8, pady=4)
+        type_var = tk.StringVar(value="单击")
+        ttk.Combobox(win, textvariable=type_var, values=["单击", "双击"],
+                     state="readonly", width=18).grid(row=row, column=1, padx=8, pady=4)
+        row += 1
+
+        before_var = tk.StringVar(value="200")
+        add_entry("点击前等待 (ms):", before_var)
+        gap_var = tk.StringVar(value="50")
+        add_entry("按下→松开 间隔 (ms):", gap_var)
+        between_var = tk.StringVar(value="80")
+        add_entry("双击时两次点击间隔 (ms):", between_var)
+
+        result = {}
+
+        def on_ok():
+            try:
+                x = int(float(x_var.get()))
+                y = int(float(y_var.get()))
+                before_delay = int(float(before_var.get()))
+                press_release_gap = int(float(gap_var.get()))
+                between_gap = int(float(between_var.get()))
+            except ValueError:
+                messagebox.showerror(APP_TITLE, "参数必须是数字。", parent=win)
+                return
+            result["value"] = {
+                "x": x, "y": y,
+                "button": button_var.get(),
+                "double": (type_var.get() == "双击"),
+                "before_delay": before_delay,
+                "press_release_gap": press_release_gap,
+                "between_gap": between_gap,
+            }
+            win.destroy()
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.grid(row=row, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        win.wait_window()
+        return result.get("value")
 
     def clear_all(self):
         if self.actions and messagebox.askyesno(APP_TITLE, "确定清空所有动作吗？"):
